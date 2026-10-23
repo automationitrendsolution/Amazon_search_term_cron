@@ -25,7 +25,7 @@ from .database import (
     replace_report_date,
 )
 from .dates import ReportChoice, choose_report, select_report_date, utc_now
-from .exceptions import ArchiveError, DatabaseError, ValidationError, VerificationError
+from .exceptions import ArchiveError, DatabaseError, EmptyReportError, ValidationError, VerificationError
 from .logging_setup import get_logger, set_context, stage
 from .processor import ProcessedReport, process_csv
 from .storage import ImportJournal, archive_processed, quarantine_failed, sha256_of
@@ -313,6 +313,16 @@ def run(
                     allow_empty=settings.allow_empty_report,
                     duplicate_policy=settings.duplicate_policy,
                 )
+            except EmptyReportError as exc:
+                if choice.period != "today":
+                    quarantine_failed(path, settings.failed_dir, str(exc))
+                    raise
+                # The account's day has only just started: Amazon has no rows yet.
+                # Nothing is written; the next hourly run picks the data up.
+                path.unlink(missing_ok=True)
+                logger.info("No data yet for %s (the day has just started for Amazon); nothing changed",
+                            choice.report_date)
+                return RunOutcome("no-data", choice.report_date, 0)
             except ValidationError as exc:
                 quarantine_failed(path, settings.failed_dir, str(exc))
                 raise

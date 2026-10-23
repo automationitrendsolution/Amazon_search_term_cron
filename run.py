@@ -166,7 +166,10 @@ def cmd_run(settings, *, dry_run: bool) -> int:
                 break  # the other report needs the same sign-in
             continue
         took = time.monotonic() - started
-        if dry_run:
+        if outcome.status == "no-data":
+            detail = f"Amazon has no rows yet for this day; nothing changed  ({took:.0f}s)"
+            results.append((choice.period, str(choice.report_date), "NO DATA", detail))
+        elif dry_run:
             detail = f"{outcome.rows:,} valid rows, MySQL not touched  ({took:.0f}s)"
             results.append((choice.period, str(choice.report_date), "DRY RUN", detail))
         else:

@@ -70,6 +70,10 @@ class ValidationError(AutomationError):
         super().__init__(f"{message}{detail}{more}")
 
 
+class EmptyReportError(ValidationError):
+    """Header but no data rows (normal for a 'Today' report early in the account's day)."""
+
+
 class SchemaError(AutomationError):
     """Destination table missing, incompatible, or not transactional."""
 

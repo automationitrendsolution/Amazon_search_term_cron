@@ -71,6 +71,29 @@ def test_both_mode_imports_yesterday_then_today(settings, db_settings, engine) -
     assert rows_by_date(engine) == {"2026-10-20": 2, "2026-10-21": 2, "2026-10-22": 2}
 
 
+def test_empty_today_report_is_no_data_not_failure(settings, db_settings, engine) -> None:
+    from dataclasses import replace
+
+    both = replace(settings, report_mode="both")
+    today = pipeline.choices_for_now(both, NOW)[1]
+    before = rows_by_date(engine)
+    outcome = pipeline.run(both, db_settings, now=NOW, retriever=fake_retriever([]), engine=engine, choice=today)
+    assert outcome.status == "no-data"
+    assert rows_by_date(engine) == before
+    assert list(settings.failed_dir.glob("*.csv")) == [] and list(settings.download_dir.glob("*.csv")) == []
+
+
+def test_empty_yesterday_report_still_fails(settings, db_settings, engine) -> None:
+    from dataclasses import replace
+
+    both = replace(settings, report_mode="both")
+    yesterday = pipeline.choices_for_now(both, NOW)[0]
+    before = rows_by_date(engine)
+    with pytest.raises(ValidationError, match="no data rows"):
+        pipeline.run(both, db_settings, now=NOW, retriever=fake_retriever([]), engine=engine, choice=yesterday)
+    assert rows_by_date(engine) == before
+
+
 def test_cutoff_mode_is_a_single_choice(settings) -> None:
     assert [c.period for c in pipeline.choices_for_now(settings, NOW)] == ["yesterday"]
 

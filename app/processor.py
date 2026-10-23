@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .exceptions import ValidationError
+from .exceptions import EmptyReportError, ValidationError
 from .logging_setup import get_logger
 
 logger = get_logger("processor")
@@ -326,7 +326,7 @@ def process_csv(
 
     if source.empty:
         if not allow_empty:
-            raise ValidationError(
+            raise EmptyReportError(
                 f"CSV {path.name} has a header but no data rows. Refusing to replace the date's "
                 "rows with nothing (set ALLOW_EMPTY_REPORT=true if an empty day is legitimate)."
             )

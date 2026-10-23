@@ -218,7 +218,8 @@ Every run ends with an **exit code**, and the summary shows it. In most cases th
 | `Run action is disabled` / `cannot tell which` | Someone ran the same report at the same moment. The next hour retries |
 | `missing required column(s)` | The saved report lost a column. Add it back in Amazon Ads |
 | `report contains date(s) ... but the selected report date is ...` | Today/Yesterday report IDs are swapped, or `AMAZON_ACCOUNT_TIMEZONE` is wrong |
-| `no data rows` | Amazon returned an empty report. Set `ALLOW_EMPTY_REPORT=true` only if that's expected |
+| Summary says `NO DATA` for the **today** report | Normal in the first hour of Amazon's day (just after midnight US Pacific). Nothing changed; the next run picks the data up |
+| `no data rows` (yesterday report) | Amazon returned an empty report for a finished day. Set `ALLOW_EMPTY_REPORT=true` only if that's expected |
 | `COMMIT OUTCOME UNKNOWN` | Nothing to do. The next run checks and records what happened |
 
 ---
