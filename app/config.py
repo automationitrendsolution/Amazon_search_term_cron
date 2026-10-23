@@ -201,6 +201,11 @@ class Settings:
     #: "both": every run imports the Yesterday report, then the Today report.
     report_mode: str = "cutoff"
 
+    #: Only for 'run.py --login' on a host without a display (the person types
+    #: the two-step code).  Scheduled runs never sign in.
+    amazon_email: str | None = None
+    amazon_password: str | None = None
+
     @property
     def required_dirs(self) -> tuple[Path, ...]:
         return (
@@ -267,6 +272,8 @@ def load_settings() -> Settings:
 
     return Settings(
         report_mode=report_mode,
+        amazon_email=_env("AMAZON_EMAIL"),
+        amazon_password=_env("AMAZON_PASSWORD"),
         report_timezone=_zone("REPORT_TIMEZONE", "Asia/Kolkata"),
         cutoff=_cutoff("TODAY_REPORT_CUTOFF", "12:30"),
         amazon_account_timezone=_zone("AMAZON_ACCOUNT_TIMEZONE", "Asia/Kolkata"),
@@ -331,7 +338,7 @@ def load_database_settings() -> DatabaseSettings:
 def secret_values() -> list[str]:
     """Values the log redaction filter must never let through."""
     secrets = []
-    for name in ("DB_PASSWORD",):
+    for name in ("DB_PASSWORD", "AMAZON_PASSWORD"):
         value = os.environ.get(name)
         if value and len(value) >= 3:
             secrets.append(value)

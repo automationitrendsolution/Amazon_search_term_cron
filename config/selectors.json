@@ -20,6 +20,18 @@
     "text=/Two-Step Verification/i"
   ],
 
+  "_note_terminal_login": "VERIFIED-ELSEWHERE (live Amazon sign-in and two-step pages, campaign project). Used only by 'run.py --login' on a host without a display: the email/password come from .env and the person types the two-step code in the terminal. Scheduled runs never sign in.",
+  "signin_email_input": ["#ap_email_login", "#ap_email", "input[type='email'][name='email']", "input[name='email']"],
+  "signin_continue_button": ["#continue", "input#continue", "input.a-button-input[type='submit']", "#continue-announce", "role=button[name=/^continue$/i]"],
+  "signin_password_input": ["#ap_password", "input[type='password'][name='password']", "input[name='password']"],
+  "signin_submit_button": ["#signInSubmit", "input#signInSubmit", "role=button[name=/^sign in$/i]"],
+  "signin_remember_me": ["input[name='rememberMe']", "#rememberMe"],
+  "signin_error_message": ["#auth-error-message-box", "div.a-alert-error .a-alert-content", "[role='alert'] .a-alert-content"],
+  "otp_input": ["#auth-mfa-otpcode", "input[name='otpCode']", "input[type='tel'][name*='otp' i]"],
+  "otp_remember_device": ["#auth-mfa-remember-device", "input[name='rememberDevice']"],
+  "otp_submit_button": ["#auth-signin-button", "input[name='mfaSubmit']", "input#auth-signin-button"],
+  "captcha_marker": ["form[action*='validateCaptcha']", "#auth-captcha-image", "img[alt*='captcha' i]", "text=/Enter the characters you see/i"],
+
   "_note_reporting": "UNVERIFIED. Shown on https://advertising.amazon.com/reporting once signed in; used only to confirm --login finished. The URL check (no /ap/ sign-in path) is the primary signal.",
   "reporting_loaded_marker": [
     "role=grid",

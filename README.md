@@ -306,12 +306,28 @@ Open each report. The address bar shows
 python run.py --login
 ```
 
-A browser window opens. Sign in yourself, including any OTP or CAPTCHA, and tick **"Don't require
-code on this browser"** if offered. The command finishes on its own once the Reporting page shows.
-The login is saved in `data/session/`. The tool never types passwords or answers security checks.
+**On a PC with a screen (Windows):** a browser window opens. Sign in yourself, including any OTP,
+and tick **"Don't require code on this browser"** if offered. The command finishes on its own once
+the Reporting page shows.
 
-On a Linux server without a screen, sign in over `ssh -X` or VNC. Or sign in on a desktop
-and copy `data/session/` to the server.
+**On a server without a screen (Ubuntu):** put `AMAZON_EMAIL` and `AMAZON_PASSWORD` in `.env`
+first. The browser stays hidden and fills them in. When Amazon sends a code, the terminal asks:
+
+```
+Amazon is asking for a two-step verification code.
+A text message with a code has been sent to your phone ending in 42
+  Verification code (attempt 1/3): 123456
+  Code accepted.
+```
+
+The tool ticks "Don't require code on this browser" for you. You get 3 tries, then it stops so the
+account is not locked. An image CAPTCHA can't be answered from a terminal. If one appears, sign in
+once with a visible browser (`ssh -X` / MobaXterm).
+
+Either way, the login is saved in `data/session/`. Sign in **on the machine that will run the job**,
+because a session copied from another computer (especially Windows → Linux) does not work.
+Scheduled runs never sign in themselves. When the session expires they stop with exit 3, and you
+run `--login` again.
 
 ### Step 6: test, then go live
 
@@ -386,6 +402,7 @@ Then resume the schedule. Keep `.env` and `data/` when you replace files.
 | `REPORT_ID_TODAY`, `REPORT_ID_YESTERDAY` | IDs of the two saved reports |
 | `REPORT_NAME_TODAY`, `REPORT_NAME_YESTERDAY` | Report names. A run stops if the page doesn't show this name |
 | `AMAZON_ENTITY_ID` | The `entityId` from the report URL |
+| `AMAZON_EMAIL`, `AMAZON_PASSWORD` | Only for `--login` on a server without a screen. Scheduled runs never use them |
 | `REPORT_READY_TIMEOUT_SECONDS` | How long to wait for Amazon to finish a report (default 20 min) |
 | `ALLOW_EMPTY_REPORT` | `false` = an empty report is rejected instead of wiping the day |
 | `DUPLICATE_POLICY` | `warn` = keep repeated rows (normal); `fail` = reject the file |
@@ -406,7 +423,9 @@ Settings already set as environment variables take priority over `.env`.
 * **Logs** automatically hide the database password, and also hide sign-in tokens and download
   links that appear in web addresses.
 * **Screenshots** can show account data. Delete old ones from time to time.
-* **The tool never types passwords** and never gets around CAPTCHA, OTP or two-step verification.
+* **Scheduled runs never sign in.** Only `--login` does, with a person present. On a server it fills
+  `AMAZON_EMAIL` / `AMAZON_PASSWORD`, and the person types the two-step code. Codes are never
+  generated or guessed, and CAPTCHAs are never answered. The password is hidden in logs.
 * **The MySQL user needs only** `SELECT, INSERT, DELETE` on the one table.
 * **`.gitignore`** excludes `.env`, `.venv`, `data/*` and `logs/*`.
 
