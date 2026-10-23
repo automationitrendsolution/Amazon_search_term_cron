@@ -1,0 +1,26 @@
+[project]
+name = "amazon-search-term-report-cron"
+version = "0.1.0"
+description = "Hourly Amazon Ads Search Term report download, validation and date-scoped MySQL import"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "mysql-connector-python>=26.7.0",
+    "pandas>=3.0.6",
+    "playwright>=1.64.0",
+    "python-dotenv>=1.2.4",
+    "sqlalchemy>=2.1.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["integration: runs real Chromium against a local mock page (skipped without Chromium)"]

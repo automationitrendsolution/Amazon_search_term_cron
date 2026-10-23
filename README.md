@@ -1,619 +1,556 @@
-# Amazon_search_term_report_cron
+# Amazon Search Term Report → MySQL
 
-Hourly automation that runs the **Amazon Ads Search Term report**, downloads the
-CSV for the correct day, validates it, and replaces that day's rows in the
-existing MySQL table **`powerbidb`.`search term report`**. Rows for every other
-date are left untouched.
+Every hour, this tool downloads the **Search Term report** from Amazon Ads and puts it into the
+MySQL table **`search term report`**. Power BI then reads the table.
 
-This is a standalone project. It does not import, modify or share state with
-`amazon-order-report-automation` or `Amazon_ad_campaign_report_cron`.
-
-> **Status:** the browser workflow has not yet been run against your real Amazon
-> Ads account, and the import has not yet been run against the production MySQL
-> table. See [Verified vs. unverified](#verified-vs-unverified) before relying on it.
+It works the same way a person would. It opens Amazon Ads in a browser, clicks **Run** on a saved
+report, waits for it to finish, and downloads the CSV. It then checks the file and replaces that
+day's rows in MySQL. Rows for other days are never touched.
 
 ---
 
 ## Contents
 
-1. [How it works](#how-it-works)
-2. [Folder structure](#folder-structure)
-3. [Prerequisites](#prerequisites)
-4. [Install with uv](#install-with-uv)
-5. [Configuration (.env)](#configuration-env)
-6. [Amazon Ads setup and login](#amazon-ads-setup-and-login)
-7. [Selectors and how to verify them](#selectors-and-how-to-verify-them)
-8. [Browser workflow](#browser-workflow)
-9. [Date cutoff rule](#date-cutoff-rule)
-10. [CSV mapping and validation](#csv-mapping-and-validation)
-11. [Database import (transaction)](#database-import-transaction)
-12. [Post-import verification](#post-import-verification)
-13. [Files, state and recovery](#files-state-and-recovery)
-14. [CLI usage and exit codes](#cli-usage-and-exit-codes)
-15. [Tests](#tests)
-16. [Ubuntu deployment with cron](#ubuntu-deployment-with-cron)
-17. [Troubleshooting](#troubleshooting)
-18. [Security and credentials](#security-and-credentials)
-19. [Verified vs. unverified](#verified-vs-unverified)
+**For everyone**
+1. [At a glance](#1-at-a-glance)
+2. [Everyday commands](#2-everyday-commands)
+3. [What happens during a run](#3-what-happens-during-a-run)
+4. [Which dates get imported](#4-which-dates-get-imported)
+5. [Where things are stored](#5-where-things-are-stored)
+6. [When something goes wrong](#6-when-something-goes-wrong)
+
+**For whoever sets it up**
+
+7. [First-time setup](#7-first-time-setup)
+8. [Running it every hour](#8-running-it-every-hour)
+9. [Settings (.env)](#9-settings-env)
+10. [Security](#10-security)
+
+**For developers**
+
+11. [Technical reference](#11-technical-reference)
+12. [Tests](#12-tests)
+13. [What has been verified](#13-what-has-been-verified)
 
 ---
 
-## How it works
+## 1. At a glance
 
-```
-cron (hourly, flock) ─► run.py
-   1 select    12:30 Asia/Kolkata rule → report date; Today/Yesterday saved report for that date
-   2 preflight MySQL reachable? schema compatible? InnoDB? finish any interrupted earlier import
-   3 download  Playwright: open report history → Actions ▸ Run → reload until THIS run shows Download → save CSV
-   4 validate  headers, dates (= selected date), numbers, duplicates — nothing touches MySQL until this passes
-   5 import    one transaction: DELETE rows of that date → INSERT CSV rows → re-count → COMMIT (or ROLLBACK)
-   6 verify    fresh connection: row count, NULL counts, metric totals, other dates unchanged
-   7 archive   move the CSV to data/processed/ (only after 5 and 6 succeed)
-```
-
-On any failure the CSV goes to `data/failed/`, with a `.error.txt` file next to it
-explaining why, and the process exits with a specific code
-(see [exit codes](#cli-usage-and-exit-codes)).
-
-## Folder structure
-
-```
-Amazon_search_term_report_cron/
-├── app/
-│   ├── __init__.py
-│   ├── auth.py            session checks, interactive --login (never answers CAPTCHA/MFA)
-│   ├── browser.py         Playwright workflow, run identification, stale-download protection
-│   ├── config.py          .env loading/validation, paths, timezones, DB settings
-│   ├── database.py        schema inspection, compatibility, transactional date-scoped replace
-│   ├── processor.py       CSV decoding, header mapping, validation, typed records
-│   ├── verifier.py        post-commit verification
-│   ├── dates.py           12:30 IST rule + choosing the Today/Yesterday saved report
-│   ├── pipeline.py        orchestration and recovery
-│   ├── storage.py         run lock, import journal, safe file moves
-│   ├── logging_setup.py   console + rotating file logs, context fields, secret redaction
-│   └── exceptions.py      error classes → exit codes
-├── config/selectors.json  every UI selector (ordered candidates) + row-text patterns
-├── data/
-│   ├── downloads/         new downloads (unique names)
-│   ├── processed/         imported AND verified files
-│   ├── failed/            files from failed runs + .error.txt notes
-│   ├── screenshots/       failure screenshots
-│   ├── session/           persistent Chromium profile = Amazon session (a credential, chmod 700)
-│   └── state/             import_journal.json, last_run.json, run.lock (no secrets)
-├── deploy/                crontab.example, logrotate.example
-├── logs/                  app.log (rotating), cron.log
-├── sql/                   read-only inspection/verification SQL
-├── tests/                 pytest suite
-├── .env.example           template; copy to .env
-├── pyproject.toml, uv.lock
-└── run.py                 CLI
-```
-
-The spec listed seven modules under `app/`. Five small helper modules were added
-(`dates`, `pipeline`, `storage`, `logging_setup`, `exceptions`) so that each
-listed module keeps a single job and can be tested on its own.
-
-## Prerequisites
-
-* Ubuntu 22.04/24.04 (or any Linux with glibc), or Windows/macOS for development
-* Python 3.12 or 3.13 (`requires-python = ">=3.12,<3.14"`); uv installs it if missing
-* [uv](https://docs.astral.sh/uv/) ≥ 0.5
-* Network access to `advertising.amazon.com` and to the MySQL server
-* A MySQL account with `SELECT, INSERT, DELETE` on `powerbidb`.`search term report`
-  (see `sql/verify_date.sql`). No DDL privileges are needed.
-
-## Install with uv
-
-```bash
-# uv itself (as the runtime user)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-cd /opt/Amazon_search_term_report_cron
-uv sync --locked                          # exact versions from uv.lock (.venv is created)
-uv run playwright install chromium        # browser binary (per user, ~150 MB)
-sudo "$(which uv)" run playwright install-deps chromium   # Ubuntu system libraries (once)
-uv run pytest -v                          # all tests should pass
-```
-
-How the project was created (for reference; do not re-run):
-
-```bash
-uv init Amazon_search_term_report_cron --app --python 3.12
-uv add playwright pandas sqlalchemy mysql-connector-python python-dotenv
-uv add --dev pytest
-```
-
-To change dependencies, use `uv add <pkg>` / `uv remove <pkg>` and commit
-`pyproject.toml` **and** `uv.lock` together. Do not use `pip install`.
-
-## Configuration (.env)
-
-```bash
-cp .env.example .env
-chmod 600 .env
-```
-
-`.env.example` documents every variable. The main ones:
-
-| Variable | Purpose |
+| | |
 |---|---|
-| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | MySQL connection (password is never logged) |
-| `REPORT_TABLE` | `search term report` (no quotes; quoting is handled by SQLAlchemy) |
-| `DB_TEXT_DATE_FORMAT` | only used if `Date` is a VARCHAR column; must match existing rows |
-| `REPORT_TIMEZONE`, `TODAY_REPORT_CUTOFF` | `Asia/Kolkata`, `12:30` (the business rule) |
-| `AMAZON_ACCOUNT_TIMEZONE` | the advertiser account's timezone (US accounts: `America/Los_Angeles`) |
-| `REPORT_ID_TODAY`, `REPORT_ID_YESTERDAY` | IDs of the two saved Search Term reports |
-| `AMAZON_ENTITY_ID` | `entityId` from the report URL (required by the console) |
-| `REPORT_POLL_INTERVAL_SECONDS`, `REPORT_READY_TIMEOUT_SECONDS` | polling cadence and limit |
-| `ALLOW_EMPTY_REPORT` | `false`: a header-only CSV is rejected instead of wiping the day |
-| `DUPLICATE_POLICY` | `warn` (keep and log) or `fail` |
+| **What** | Amazon Ads *Search Term* report (Sponsored Products / Display) |
+| **Source** | Two saved reports in Amazon Ads: one for *Today*, one for *Yesterday* |
+| **Destination** | MySQL table `search term report` (server and database are set in `.env`) |
+| **How often** | Every hour (Windows Task Scheduler or Linux cron) |
+| **Time per run** | About 5 minutes per report, so about 10 minutes for both |
+| **What it changes** | Only the rows of the date being imported. Every other date stays as it is. |
+| **If anything is wrong** | It stops **before** writing, so the database keeps its previous data |
 
-Variables already exported in the environment take precedence over `.env`.
+---
 
-## Amazon Ads setup and login
+## 2. Everyday commands
 
-### 1. Create two saved Search Term reports (one time, in the Amazon Ads UI)
+Run these from the project folder. On Windows, open PowerShell in the folder. If the virtual
+environment is active (the prompt starts with `(amazon-search-term-report-cron)`), type `python run.py …`.
+Otherwise use `uv run python run.py …`. Both do the same thing.
 
-Under **Reporting → Sponsored ads reports → Create report**:
-
-| Setting | Report A | Report B |
+| I want to… | Command | Changes the database? |
 |---|---|---|
-| Report category / type | Sponsored Products → **Search term** | same |
-| Time unit | **Daily** (the CSV must have a `Date` column) | same |
+| Import the reports now | `python run.py` | Yes |
+| Test without writing anything | `python run.py --dry-run` | No |
+| Watch the browser while it works | `python run.py --dry-run --headed` | No |
+| Sign in to Amazon again | `python run.py --login` | No |
+| Check the database connection and table | `python run.py --check-db` | No |
+| Check the Amazon report page | `python run.py --inspect-report` | No |
+| Check a CSV file I already have | `python run.py --validate-csv FILE.csv --expected-date 2026-10-22` | No |
+
+> In PowerShell, always type `python` before `run.py`. Typing `run.py` on its own gives
+> *"The term 'run.py' is not recognized"*.
+
+### What a normal run looks like
+
+```
+== Yesterday report | 2026-10-21 ===================================
+18:00:05        preflight Table currently holds 0 row(s) for 2026-10-21
+18:00:16        download  Run triggered ...
+18:00:50        download  Status poll 2: pending Processing ...
+18:03:40        validate  CSV valid: 184,233 row(s) for 2026-10-21 | Impressions ..., Spend ..., Sales ...
+18:04:12        import    Transaction COMMITTED for 2026-10-21: deleted=0 inserted=184233
+18:04:14        verify    Verified: row count 184233 matches the CSV
+...
+== Today report | 2026-10-22 =======================================
+...
+== Summary =========================================================
+  yesterday  2026-10-21   OK       184,233 rows imported, 0 replaced  (250s)
+  today      2026-10-22   OK       25,186 rows imported, 15,181 replaced  (420s)
+```
+
+Warnings show in **yellow** and errors in **red**. The full detail of every run is also saved in
+`logs/app.log`.
+
+---
+
+## 3. What happens during a run
+
+```
+ 1. Pick dates     Which day(s) to import and which saved report to use
+ 2. Check MySQL    Is the database reachable and does the table look right?
+ 3. Amazon         Open the saved report → Actions ▸ Run → wait → Download the CSV
+ 4. Check the CSV  Right columns? Right date? Valid numbers? (MySQL not touched yet)
+ 5. Import         Delete that date's rows → insert the new rows → count them
+                   → save only if the count matches; otherwise undo everything
+ 6. Double-check   Re-read the table: row count and totals (Spend, Sales, ...) match the CSV,
+                   and other dates are unchanged
+ 7. File it        Move the CSV to data/processed/
+```
+
+If any step fails, the CSV goes to `data/failed/` with a `.error.txt` note explaining why. The
+database keeps its previous data.
+
+---
+
+## 4. Which dates get imported
+
+This is set by `REPORT_MODE` in `.env`.
+
+### `REPORT_MODE=both` (recommended, currently in use)
+
+Every run imports **both** reports, one after the other:
+
+1. **Yesterday** report → replaces yesterday's rows
+2. **Today** report → replaces today's rows
+
+Amazon keeps updating sales and attribution for a few hours after a day ends. Refreshing
+yesterday on every run picks up those late changes. If one report fails, the other still runs.
+
+### `REPORT_MODE=cutoff` (one report per run)
+
+The date depends on the time in India:
+
+| Time in India | Date imported |
+|---|---|
+| 12:00 AM – 12:29 PM | yesterday |
+| 12:30 PM – 11:59 PM | today |
+
+### Why the dates follow US Pacific time
+
+Amazon decides what "Today" and "Yesterday" mean in the **advertiser account's** timezone. For this
+account that's US Pacific (`AMAZON_ACCOUNT_TIMEZONE=America/Los_Angeles`). The dates in MySQL
+match the dates inside Amazon's CSV.
+
+* 12:30 PM in India = 12:00 AM Pacific (summer time). That's where the 12:30 cutoff comes from.
+* In winter (Pacific standard time), 12:00 AM Pacific = 1:30 PM in India. In `cutoff` mode, runs
+  between 12:30 and 1:30 PM India time are **skipped safely**, because the new day has not started
+  for Amazon yet. The next hourly run picks it up.
+
+Before importing, the app always checks that every row in the CSV has the expected date. A wrong
+report can never be imported under the wrong date.
+
+---
+
+## 5. Where things are stored
+
+| Place | What's in it |
+|---|---|
+| MySQL `search term report` | The imported data (the server and database are set in `.env`) |
+| `data/processed/` | CSVs that were imported and verified |
+| `data/failed/` | CSVs that were rejected, plus a `.error.txt` note for each |
+| `data/downloads/` | CSVs being downloaded (normally empty) |
+| `data/screenshots/` | Browser screenshots taken when something goes wrong |
+| `data/session/` | The saved Amazon login. **Treat it like a password.** |
+| `logs/app.log` | Full log of every run |
+
+### Columns: Amazon CSV → MySQL
+
+| Amazon CSV | MySQL column |
+|---|---|
+| Date | `Date` |
+| Portfolio name | `Portfolio name` |
+| Campaign name | `Campaign Name` |
+| Targeting | `Targeting` |
+| Targeting match type | `Match Type` |
+| Search term | `Customer Search Term` |
+| Impressions | `Impressions` |
+| Clicks | `Clicks` |
+| Total cost | `Spend` |
+| Sales | `Sales` |
+| Purchases | `Units` |
+| Cost per 1,000 viewable impressions (VCPM), *if present* | `Cost per 1,000 viewable impressions (VCPM)` |
+
+Good to know:
+* **Other CSV columns** (Hour, Ad group name, CPC, CTR…) are ignored. The log lists them.
+* **The same search term can appear on several rows.** The report is hourly and split by ad group,
+  and neither is imported. All rows are kept, so the totals are correct.
+* **Blank search terms are stored as NULL.** Sponsored Display rows target products or categories
+  instead of keywords, so they have no search term.
+* **Empty number cells are stored as NULL, not 0.**
+
+---
+
+## 6. When something goes wrong
+
+Every run ends with an **exit code**, and the summary shows it. In most cases the database is
+**unchanged**, and the next hourly run tries again.
+
+| Code | Meaning | What to do |
+|---|---|---|
+| **0** | Success, or skipped because the day has not started for Amazon yet | Nothing |
+| **2** | A setting in `.env` is wrong | Read the message and fix `.env` |
+| **3** | Amazon wants you to sign in again (session expired, CAPTCHA or OTP) | `python run.py --login` |
+| **4** | Problem in Amazon Ads (slow, page changed, download failed) | Usually fixes itself next hour; see below |
+| **5** | The CSV did not pass the checks | Read the `.error.txt` in `data/failed/` |
+| **6** | Database problem (connection, permissions, table) | `python run.py --check-db` |
+| **7** | Data was saved, but the double-check found a difference | See below. The data **is** in MySQL |
+| **8** | Data saved and verified, but the CSV could not be moved | Move the file named in the log to `data/processed/` |
+| **9** | Another run is still in progress | Wait; it will finish |
+| **1** | Unexpected error | Look at the end of `logs/app.log` |
+
+### Common messages
+
+| Message | Fix |
+|---|---|
+| `Access denied for user ...` | Wrong DB user/password in `.env`, or the user lacks permission (§7 step 3) |
+| `Destination table ... does not exist` | Create the table (§7 step 3) |
+| `sign-in-required` / `security-challenge` | `python run.py --login` |
+| `Sorry, something went wrong` | `AMAZON_ENTITY_ID` is wrong, or this login cannot see the report |
+| `still 'pending' after ...s` | Amazon is slow. Raise `REPORT_READY_TIMEOUT_SECONDS` (keep it under 50 min) |
+| `selector key '...'` | Amazon changed its page. Run `python run.py --inspect-report --headed` (§11) |
+| `Run action is disabled` / `cannot tell which` | Someone ran the same report at the same moment. The next hour retries |
+| `missing required column(s)` | The saved report lost a column. Add it back in Amazon Ads |
+| `report contains date(s) ... but the selected report date is ...` | Today/Yesterday report IDs are swapped, or `AMAZON_ACCOUNT_TIMEZONE` is wrong |
+| `no data rows` | Amazon returned an empty report. Set `ALLOW_EMPTY_REPORT=true` only if that's expected |
+| `COMMIT OUTCOME UNKNOWN` | Nothing to do. The next run checks and records what happened |
+
+---
+
+## 7. First-time setup
+
+Do this once, on the machine that will run the job.
+
+### Step 1: install
+
+You need Python 3.12 or 3.13 and [uv](https://docs.astral.sh/uv/).
+
+```bash
+uv sync --locked                      # installs exact versions into .venv
+uv run playwright install chromium    # the browser (~150 MB)
+uv run pytest -q -m "not integration" # all tests should pass
+```
+
+On Ubuntu, install the browser's system libraries once:
+`sudo "$(which uv)" run playwright install-deps chromium`.
+
+### Step 2: settings
+
+Copy `.env.example` to `.env` and fill it in (see [§9](#9-settings-env)). `.env` holds passwords,
+so never share or commit it.
+
+### Step 3: MySQL table and user
+
+The app **never creates or changes tables**. On a fresh database, run this once as a MySQL admin
+(change the database name, user and password as needed):
+
+```sql
+CREATE DATABASE IF NOT EXISTS search_term;
+
+CREATE TABLE search_term.`search term report` (
+  `id`                                         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `Date`                                       DATE           NOT NULL,
+  `Portfolio name`                             VARCHAR(255)   NULL,
+  `Campaign Name`                              VARCHAR(255)   NOT NULL,
+  `Targeting`                                  VARCHAR(1024)  NULL,
+  `Match Type`                                 VARCHAR(64)    NULL,
+  `Customer Search Term`                       VARCHAR(1024)  NULL,
+  `Impressions`                                BIGINT         NULL,
+  `Clicks`                                     BIGINT         NULL,
+  `Spend`                                      DECIMAL(18,4)  NULL,
+  `Sales`                                      DECIMAL(18,4)  NULL,
+  `Units`                                      BIGINT         NULL,
+  `Cost per 1,000 viewable impressions (VCPM)` DECIMAL(18,4)  NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_date` (`Date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE USER IF NOT EXISTS 'search'@'localhost' IDENTIFIED BY 'choose-a-password';
+GRANT SELECT, INSERT, DELETE ON search_term.`search term report` TO 'search'@'localhost';
+```
+
+The app only needs `SELECT, INSERT, DELETE`. Then check it:
+
+```bash
+python run.py --check-db     # should end with "Schema is compatible ... Nothing was changed."
+```
+
+### Step 4: the two saved reports in Amazon Ads
+
+In Amazon Ads, go to **Reporting → Create report → Search term** and create two reports:
+
+| Setting | Report 1 | Report 2 |
+|---|---|---|
+| Name (example) | `search term_today` | `search term_yesterday` |
 | Report period | **Today** | **Yesterday** |
-| File format | **CSV** | CSV |
-| Columns | at least: Date, Portfolio name, Campaign name, Targeting, Targeting match type, Search term, Impressions, Clicks, Total cost, Sales, Purchases (optionally VCPM) | same |
+| Time unit | Daily or Hourly (the hour is not imported) | same |
+| File format | CSV | CSV |
+| Columns (at least) | Date, Portfolio name, Campaign name, Targeting, Targeting match type, Search term, Impressions, Clicks, Total cost, Sales, Purchases | same |
 
-Open each report's history page. Its URL has the form
-`https://advertising.amazon.com/reporting/history?entityId=ENTITY…&reportId=xxxxxxxx-…`.
-Copy `reportId` into `REPORT_ID_TODAY` / `REPORT_ID_YESTERDAY`, and copy `entityId`
-into `AMAZON_ENTITY_ID`.
+Open each report. The address bar shows
+`...reporting/history?entityId=ENTITY...&reportId=xxxxxxxx-...`. Copy:
+* `reportId` → `REPORT_ID_TODAY` / `REPORT_ID_YESTERDAY`
+* `entityId` → `AMAZON_ENTITY_ID`
+* each report's exact name → `REPORT_NAME_TODAY` / `REPORT_NAME_YESTERDAY`. This guards against
+  swapped IDs.
 
-> **Why two saved reports and not a date picker?** Re-running a saved report from
-> its history page has been observed to work on this console (Actions ▸ Run). Editing
-> a report's date range through the UI has not been verified, and the automation
-> does not attempt it. With a relative period ("Today"/"Yesterday") the same
-> definition stays valid every day. The CSV's `Date` column is still checked
-> against the selected date, so a wrong report can never be imported.
-
-### 2. Interactive login (creates the persistent session)
+### Step 5: sign in to Amazon
 
 ```bash
-uv run python run.py --login
+python run.py --login
 ```
 
-A visible Chromium window opens on `https://advertising.amazon.com/reporting`.
-Sign in normally and complete any CAPTCHA, OTP or two-step verification yourself.
-If Amazon offers "Don't require code on this browser", tick it. The command
-finishes on its own once the reporting page is showing. The session is stored in
-`data/session/`. The automation **never** fills in passwords and never solves
-CAPTCHA or MFA challenges.
+A browser window opens. Sign in yourself, including any OTP or CAPTCHA, and tick **"Don't require
+code on this browser"** if offered. The command finishes on its own once the Reporting page shows.
+The login is saved in `data/session/`. The tool never types passwords or answers security checks.
 
-On a headless Ubuntu server, choose one of:
+On a Linux server without a screen, sign in over `ssh -X` or VNC. Or sign in on a desktop
+and copy `data/session/` to the server.
 
-* `ssh -X user@server` (X11 forwarding), then run `--login`;
-* `xvfb-run` is **not** enough on its own, because you have to see and use the window.
-  Use a VNC/remote desktop session instead;
-* sign in on a desktop machine with the same project, then copy `data/session/` to
-  the server (`rsync -a --chmod=D700,F600`). Use the same OS family and
-  Chromium version if you can.
-
-To keep Amazon from treating the headless scheduled runs as a different browser,
-set `BROWSER_USER_AGENT` to the user agent string of the headed browser
-(see `.env.example`).
-
-When the session expires, scheduled runs exit with code **3** and save a
-screenshot. Run `--login` again to fix it.
-
-## Selectors and how to verify them
-
-All locators live in `config/selectors.json` as **ordered candidate lists**. The
-first visible match wins. If Amazon changes its UI, put a working selector at the
-top of the affected key; no code change is needed. Keys:
-
-| Key | Used for | Status |
-|---|---|---|
-| `sign_in_marker`, `security_challenge_marker` | detect expired session / CAPTCHA / MFA | verified on live Amazon pages (sibling project) |
-| `report_history_loaded_marker` (`role=grid`) | history page rendered | verified-elsewhere |
-| `report_actions_menu`, `run_report_menu_item` | Actions ▸ **Run** | verified-elsewhere |
-| `history_row` (`.ag-center-cols-container .ag-row`) | run rows | verified-elsewhere |
-| `history_row_download` (`a:has-text('Download')`) | Download link inside a row | verified-elsewhere |
-| `pattern_created_at` | parses "Oct 20, 2026 2:00 AM PDT" from a row | verified-elsewhere format |
-| `pattern_status_failed` | failed-run wording | **unverified** |
-| `reporting_loaded_marker`, `run_report_button`, `run_report_confirm_button`, `report_not_found_marker` | fallbacks | **unverified** |
-
-"Verified-elsewhere" means the selector was confirmed on 2026‑10‑20 on the live
-Amazon Ads report-history page for a **Campaign** report, by the sibling
-`Amazon_ad_campaign_report_cron` project. The Search Term report uses the same
-reporting console, but this has **not** been confirmed for your Search Term reports.
-
-**Verify them** (read-only: it opens and closes the Actions menu but never clicks Run):
+### Step 6: test, then go live
 
 ```bash
-uv run python run.py --inspect-report --headed
+python run.py --inspect-report     # finds the Run menu and Download link? (changes nothing)
+python run.py --dry-run --headed   # full download + checks, MySQL untouched
+python run.py                      # first real import
 ```
 
-This prints, for every key, how many elements each candidate matches. It also
-prints the parsed history rows (status, Date created, whether a Download link
-exists) and saves a screenshot. Check that:
+Check the result in MySQL:
 
-1. `history_row` matches the visible runs;
-2. every row shows `created` and `created_utc` (otherwise fix `pattern_created_at`);
-3. `run_menu_item_found` is `true`.
-
-Then do one `--dry-run` (below) before enabling cron.
-
-## Browser workflow
-
-`app/browser.py → retrieve_report()`:
-
-1. Launch Chromium with the persistent profile `data/session/`, with the browser
-   timezone pinned to `AMAZON_ACCOUNT_TIMEZONE`.
-2. Open `reporting/history?entityId=…&reportId=…` for the chosen saved report.
-3. Stop if Amazon shows sign-in, CAPTCHA or MFA (exit 3), or the error panel
-   "Sorry, something went wrong". Wait for the grid.
-4. **Snapshot** every visible run row and its *Date created*, record the trigger
-   time (UTC), then click **Actions ▸ Run**. The run fails if Run is missing or disabled.
-5. Write `data/state/last_run.json`: report ID, period, report date, trigger time
-   and the pre-trigger rows.
-6. Reload every `REPORT_POLL_INTERVAL_SECONDS`. On each reload, look for **this
-   execution's run**: a row whose *Date created* was **not** in the snapshot and is
-   no earlier than the trigger minute minus `RUN_CLOCK_SKEW_SECONDS`.
-7. When that row (and only that row) shows a Download link, find it again by its
-   *Date created*, click the link, and save the file as
-   `data/downloads/<UTC stamp>_<date>_<period>_<report id>_search_term.csv`.
-8. Check the file is non-empty, readable and not an HTML page, then pass it on.
-
-**Stale-download protection — the run fails rather than guessing when:**
-
-* nothing new has appeared yet. An older row with a Download link on top of the
-  grid is never used;
-* a new row's *Date created* cannot be parsed, or uses an unknown timezone
-  abbreviation;
-* two or more new runs have appeared since the trigger;
-* the new run has the same *Date created* minute as an older run.
-
-Timeouts and errors: navigation timeouts, missing selectors, download timeouts
-and browser crashes raise `BrowserError` (exit 4). These are retried once
-(`BROWSER_RETRIES`). Authentication problems, stale-run ambiguity and
-report-not-ready timeouts are not retried. Each failure saves a screenshot to
-`data/screenshots/`. URLs are logged without their query strings, and page
-HTML and cookies are never saved.
-
-## Date cutoff rule
-
-> **`REPORT_MODE=both`** skips the cutoff rule: every run imports the
-> *Yesterday* report for the account's yesterday, then the *Today* report for the
-> account's today (dates in `AMAZON_ACCOUNT_TIMEZONE`). Each report is its own
-> date-scoped transaction; if one fails, the other still runs and the exit code is
-> the first failure's. The default, `REPORT_MODE=cutoff`, is described below.
-
-Implemented in `app/dates.py → select_report_date()`. The rule is always evaluated
-in **Asia/Kolkata**, using timezone-aware datetimes and `zoneinfo`, whatever the
-server's timezone is:
-
-| Time in IST | Report date |
-|---|---|
-| 00:00:00 – 12:29:59 | yesterday |
-| 12:30:00 exactly | today |
-| 12:30:01 – 23:59:59 | today |
-
-The function accepts an injectable `now` or `clock`, and rejects naive datetimes.
-
-**Account timezone.** Amazon evaluates a saved report's "Today"/"Yesterday" in the
-*advertiser account's* timezone. `choose_report()` therefore compares the selected
-date with the account's current date to pick the right saved report. For a US
-account (Pacific time):
-
-* 10:00 IST on Oct 22 is 21:30 PDT on Oct 21. The selected date is Oct 21,
-  which is the account's **Today** report.
-* 13:00 IST on Oct 22 is 00:30 PDT on Oct 22. The selected date is Oct 22,
-  again the **Today** report.
-* 12:30–13:29 IST in winter (PST): the selected date (IST today) has **not started
-  yet** in Pacific time. The run logs "Skipping" and exits 0 without changing
-  anything. The next hourly run picks it up.
-
-For an India-based account (`AMAZON_ACCOUNT_TIMEZONE=Asia/Kolkata`) it is simply
-before 12:30 → Yesterday report, from 12:30 → Today report.
-
-## CSV mapping and validation
-
-| Amazon column | MySQL column |
-|---|---|
-| Date | Date |
-| Portfolio name | Portfolio name |
-| Campaign name | Campaign Name |
-| Targeting | Targeting |
-| Targeting match type | Match Type |
-| Search term | Customer Search Term |
-| Impressions | Impressions |
-| Clicks | Clicks |
-| Total cost | Spend |
-| Sales | Sales |
-| Purchases | Units |
-| *(Cost per 1,000 viewable impressions (VCPM), if present)* | Cost per 1,000 viewable impressions (VCPM) |
-
-If the table has a VCPM column and the CSV does not, VCPM is written as **NULL**.
-Nothing is ever made up.
-
-Validation (`app/processor.py`), **all before any database connection**:
-
-* **File level:** non-empty; not ZIP/XLSX/PDF/HTML; UTF‑8 (with or without BOM),
-  UTF‑16 with BOM, or a logged Windows‑1252 fallback; every row has the header's
-  field count.
-* **Headers:** BOM, non-breaking spaces, extra whitespace and case are normalised.
-  Only those are normalised, so `Purchases` and `Purchases (multi-touch)` stay
-  distinct. All 11 required columns must be present. Two headers that normalise
-  to the same name are an error. Unmapped columns are **named in the log** and ignored.
-* **Dates:** one format must parse every row (`Oct 21, 2026` as seen in live exports,
-  `2026-10-21`, `10/21/2026`…; override with `CSV_DATE_FORMAT`). Every row must equal
-  the selected report date.
-* **Numbers:** parsed exactly (`Decimal`, no floats). Thousands separators and a
-  leading currency symbol are accepted. `abc`, `1.2.3`, `12%` and `1e3` are
-  rejected. Impressions, Clicks and Purchases must be non-negative whole numbers.
-  An empty cell or `-` becomes **NULL**, not 0.
-* **Text:** kept verbatim (no trimming or case changes). Search terms such as
-  `null` or `NA` are kept as text because pandas NA inference is off. A blank
-  Portfolio name becomes NULL. Date and Campaign name must not be empty. A blank Search term (Sponsored Display rows
-  target ASINs/categories, not keywords) is kept and stored as NULL.
-* **Duplicates:** exact duplicates and repeated
-  (date, campaign, targeting, match type, search term) keys are counted and logged.
-  Amazon emits one row per ad group, and ad group is not mapped. Rows are **never
-  deduplicated**. `DUPLICATE_POLICY=fail` rejects such files instead.
-* **Header-only file:** rejected unless `ALLOW_EMPTY_REPORT=true`, so a
-  partial or empty report cannot wipe a day.
-
-## Database import (transaction)
-
-`app/database.py`. The production table is never altered: no
-CREATE/ALTER/DROP/TRUNCATE/RENAME, and a test enforces this.
-
-1. **Inspect** with SQLAlchemy reflection and `INFORMATION_SCHEMA.TABLES.ENGINE`.
-2. **Refuse** to continue (exit 6, nothing changed) if:
-   * a mapped column is missing (names match exactly);
-   * a column type is incompatible (e.g. a numeric `Customer Search Term`, or an
-     integer `Spend`);
-   * an unmapped `NOT NULL` column has no default;
-   * the engine is not InnoDB;
-   * a text `Date` column holds values that are not in `DB_TEXT_DATE_FORMAT`.
-3. **Fit check per value**, still before writing: VARCHAR lengths, DECIMAL
-   scale/precision (rounding away digits is refused), integer ranges, and NOT NULL.
-4. **One connection, one transaction:**
-   * fingerprint the rows outside the date (count plus metric sums);
-   * `DELETE … WHERE <date predicate>`;
-   * `INSERT` the rows in batches of 1,000;
-   * `SELECT COUNT(*)` for the date inside the transaction.
-5. **COMMIT** only if that count equals the CSV row count. Otherwise **ROLLBACK**.
-
-Date predicate by column type:
-
-| Column type | Predicate |
-|---|---|
-| `DATE` | `` `Date` = :d `` |
-| `DATETIME` / `TIMESTAMP` | `` `Date` >= :d 00:00:00 AND `Date` < :d+1 00:00:00 `` (half-open; for TIMESTAMP, `DB_SESSION_TIME_ZONE` sets the session zone) |
-| `VARCHAR` / `CHAR` | `` `Date` = :d rendered with DB_TEXT_DATE_FORMAT `` |
-
-The table name and column names contain spaces, commas and parentheses. Every
-statement is built from the reflected `Table`, so the MySQL dialect quotes the
-identifiers. Bind parameters use synthetic names (`p0`…`pN`).
-
-The log records the selected date, rows deleted and inserted, and whether the
-transaction was COMMITTED or ROLLED BACK.
-
-**Retries.** The transaction is retried (`DB_MAX_ATTEMPTS`) only after a
-connection error **that was rolled back**. Because the operation is a date-scoped
-replace, running it again gives the same result. If COMMIT itself fails, the
-outcome is unknown. In that case the import is **not** retried; see recovery below.
-
-## Post-import verification
-
-`app/verifier.py` runs on a new connection after COMMIT and checks:
-
-* the required columns still exist;
-* the number of rows for the date equals the CSV row count. When the CSV has rows,
-  the table must too;
-* Impressions, Clicks, Units, Spend and Sales are valid numbers (integers where
-  required), and their NULL counts and **totals equal the CSV's**;
-* the count and metric sums of **all other dates are unchanged**. If they changed,
-  another process may be writing to the table at the same time.
-
-If verification fails, the run exits with code **7** and the log says
-**"THE TRANSACTION IS ALREADY COMMITTED"**. The CSV is kept in `data/failed/` for
-investigation.
-
-## Files, state and recovery
-
-* Filenames are unique (UTC timestamp, date, period, report ID). A move never
-  overwrites an existing file; `-1`, `-2`… is appended. Files are never bulk-deleted.
-* `data/processed/` only receives files whose import committed **and** passed
-  verification. If the archive move itself fails, the run exits with code **8**:
-  the data is fine and the file is left where it was.
-* `data/state/import_journal.json` records each import's progress through
-  `started → committed → verified → archived`, along with the expected counts and
-  totals (no secrets).
-* **Recovery:** if a previous run stopped in `started`, `committed`,
-  `commit-unknown` or `verify-failed`, the next run first compares the table with
-  the recorded expectations. It then marks that import as committed (and archives
-  the file) or as not applied (and moves the file to `failed/`). Only after that
-  does it start a new destructive operation.
-* `data/session/` (chmod 700) is the Amazon login and must be treated like a
-  password. `data/state/` holds no cookies or credentials.
-
-## CLI usage and exit codes
-
-```bash
-uv run python run.py                     # full run (what cron executes)
-uv run python run.py --dry-run           # Amazon download + CSV validation; MySQL untouched
-uv run python run.py --login             # interactive sign-in (visible browser)
-uv run python run.py --validate-csv FILE [--expected-date YYYY-MM-DD]   # local file, MySQL untouched
-uv run python run.py --check-db          # read-only: connection, schema, engine, date format
-uv run python run.py --inspect-report    # read-only selector check on the live page
-uv run python run.py --dry-run --headed  # watch the browser
+```sql
+SELECT `Date`, COUNT(*), SUM(Spend), SUM(Sales)
+FROM `search term report` GROUP BY `Date` ORDER BY `Date`;
 ```
 
-| Exit | Meaning | Database state |
-|---|---|---|
-| 0 | success, or skipped (date not started for the account) | updated / unchanged |
-| 1 | unexpected error (traceback in `logs/app.log`) | see log |
-| 2 | configuration error | unchanged |
-| 3 | Amazon sign-in needed (expired session, CAPTCHA, MFA) | unchanged |
-| 4 | browser or report retrieval failed (timeout, selector, download, stale-run ambiguity) | unchanged |
-| 5 | CSV validation failed | unchanged |
-| 6 | database or schema error | rolled back / unchanged, **unless** the log says `COMMIT OUTCOME UNKNOWN` |
-| 7 | post-commit verification failed | **committed** |
-| 8 | archive move failed after a verified import | committed and verified |
-| 9 | another run holds the lock | unchanged |
+---
 
-## Tests
+## 8. Running it every hour
 
-```bash
-uv run pytest -v                 # everything (~45 s, including real-Chromium tests)
-uv run pytest -v -m "not integration"   # skip the Chromium tests (~5 s)
+### Windows (Task Scheduler)
+
+Run once in PowerShell:
+
+```powershell
+$dir = "C:\Users\Dell\Desktop\Amazon_search_term_report_cron"
+$action  = New-ScheduledTaskAction -Execute "$dir\.venv\Scripts\python.exe" -Argument "run.py" -WorkingDirectory $dir
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddHours((Get-Date).Hour + 1).AddMinutes(5) -RepetitionInterval (New-TimeSpan -Hours 1)
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 55) -MultipleInstances IgnoreNew -StartWhenAvailable
+Register-ScheduledTask -TaskName "Amazon Search Term Report" -Action $action -Trigger $trigger -Settings $settings
 ```
 
-| File | Covers |
-|---|---|
-| `test_dates.py` | 12:29:59 / 12:30:00 / 12:30:01 / midnight IST, other-timezone datetimes, child processes with `TZ` set to LA, UTC, Kiritimati and EST5EDT, naive datetimes rejected, Today/Yesterday choice in the account timezone, not-yet-started skip |
-| `test_processor.py` | header mapping, BOM/whitespace/case, distinct columns kept distinct, missing and duplicate headers, empty/binary/HTML/header-only files, invalid numbers, NULL not 0, malformed/mixed/mismatched dates, verbatim search terms, duplicates, cp1252 and UTF‑16 |
-| `test_database.py` | schema compatibility, missing table/column, wrong types, non-InnoDB refused, value fit, **rollback after a failed insert restores the deleted rows**, count-mismatch rollback, COMMIT-unknown, **other dates preserved**, idempotent reruns, DATETIME half-open range, text dates, no DDL in the code, password never logged |
-| `test_verifier.py` | success, count mismatch, changed values, invalid stored numbers, other dates changed, no rows |
-| `test_pipeline.py` | full run → processed only after verify, wrong-date CSV, DB failure, verification failure, archive failure, dry run leaves MySQL untouched, skip, recovery both ways, recovery before import, retry policy |
-| `test_browser_logic.py` | Date-created parsing, **stale Download never used**, old run finishing ≠ ours, clock skew, two new runs / same-minute collision / unreadable row fail closed, polling success/timeout/failed, missing download control, download timeout, retry policy |
-| `test_browser_integration.py` | **real Playwright + Chromium** against a local mock of the history page: Run → Processing → Completed → only the new run downloaded; no new run → timeout, nothing downloaded; sign-in page → exit 3 with a screenshot |
-| `test_storage_and_cli.py` | lock contention (exit 9), no-overwrite moves, failure notes, journal, log redaction, CLI exit codes |
+* It runs at 5 minutes past every hour, **only while the PC is on and you are logged in**.
+* To test it: Task Scheduler → right-click the task → **Run**, then watch `logs/app.log`.
+* To pause it: right-click → **Disable**.
 
-Tests use a temporary SQLite database with the same table and column names
-(spaces, commas, parentheses), plus a local HTTP mock of Amazon. They never
-contact Amazon or MySQL. `time.tzset` exists only on POSIX, so on Windows one
-in-process timezone test is skipped; the subprocess variant still runs.
-
-## Ubuntu deployment with cron
+### Linux (cron)
 
 ```bash
-# 1. runtime user and code
-sudo adduser --disabled-password --gecos "" amzreports
-sudo mkdir -p /opt/Amazon_search_term_report_cron
-sudo chown amzreports: /opt/Amazon_search_term_report_cron
-sudo -iu amzreports
-git clone <repo> /opt/Amazon_search_term_report_cron     # or unzip the archive
-cd /opt/Amazon_search_term_report_cron
-
-# 2. uv, dependencies, browser
-curl -LsSf https://astral.sh/uv/install.sh | sh && source ~/.bashrc
-uv sync --locked
-uv run playwright install chromium
-exit; sudo /home/amzreports/.local/bin/uv --directory /opt/Amazon_search_term_report_cron run playwright install-deps chromium; sudo -iu amzreports
-
-# 3. configuration and permissions
-cd /opt/Amazon_search_term_report_cron
-cp .env.example .env && chmod 600 .env && nano .env
-chmod 700 data/session data/state
-uv run pytest -q -m "not integration"
-
-# 4. database check (read-only)
-uv run python run.py --check-db
-
-# 5. Amazon login (needs a display: ssh -X / VNC, see above), then verify selectors
-uv run python run.py --login
-uv run python run.py --inspect-report
-
-# 6. full dry run: runs and downloads the real report, validates, writes nothing to MySQL
-uv run python run.py --dry-run; echo "exit=$?"
-
-# 7. first real run by hand, then check the date in MySQL (sql/verify_date.sql)
-uv run python run.py; echo "exit=$?"
-
-# 8. schedule
-crontab -e        # paste deploy/crontab.example (adjust paths: `which uv`)
+crontab -e     # paste deploy/crontab.example and adjust the paths (`which uv`)
 sudo cp deploy/logrotate.example /etc/logrotate.d/amazon_search_term_report
 ```
 
-The cron line runs from the project directory as `amzreports`, so it can reach
-`.env`, `data/session` and the uv-managed `.venv`. It uses `flock -n` so runs never
-overlap (the app also holds `data/state/run.lock`), and `timeout 55m` so a hung
-run cannot block the next hour. The server's timezone does not affect which date
-is selected.
+The cron line uses `flock` and `timeout 55m`, so runs never overlap and a stuck run can't block the
+next hour. The server's own timezone doesn't matter.
 
-**Logs:** `logs/app.log` (rotating, 5 MB × 10) and `logs/cron.log` (rotated by
-logrotate). Each line carries the workflow stage, selected date, file and row count:
+### Updating the code safely
 
-```
-2026-10-22 09:05:41 INFO    [import] date=2026-10-21 file=…_search_term.csv rows=1834 stc.database: Transaction COMMITTED for 2026-10-21: deleted=1790 inserted=1834
-```
-
-**Updating safely:**
+Pause the schedule, then:
 
 ```bash
-cd /opt/Amazon_search_term_report_cron
-crontab -l > /tmp/cron.bak && crontab -r   # optional: pause
-git pull                                    # or unpack the new archive (keep .env, data/)
 uv sync --locked
 uv run pytest -q -m "not integration"
-uv run python run.py --dry-run
-crontab /tmp/cron.bak                       # resume
+python run.py --dry-run
 ```
 
-## Troubleshooting
+Then resume the schedule. Keep `.env` and `data/` when you replace files.
 
-| Symptom | What to do |
+---
+
+## 9. Settings (.env)
+
+`.env.example` explains every setting. The ones you are most likely to touch:
+
+| Setting | What it does |
 |---|---|
-| exit 3, `sign-in-required` / `security-challenge` screenshot | `uv run python run.py --login`; set `BROWSER_USER_AGENT` if MFA comes back every run |
-| exit 4, "Sorry, something went wrong" | `AMAZON_ENTITY_ID` is missing or wrong, or this login cannot see the report |
-| exit 4, "selector key '…'" | `--inspect-report --headed`; move a working selector to the top of that key in `config/selectors.json` |
-| exit 4, "still 'pending' after …s" | Amazon is slow: raise `REPORT_READY_TIMEOUT_SECONDS` (keep it under ~50 min) |
-| exit 4, "Failing closed" / "cannot tell which" | someone else started a run at the same moment; the next hourly run retries. Check `pattern_created_at` if the row text was "could not be read" |
-| exit 4, "Run action is disabled" | a run is already in progress on Amazon's side; the next hour retries |
-| exit 5, "missing required column(s)" | the saved report's columns differ; add the columns in Amazon Ads (Time unit **Daily**) |
-| exit 5, "report contains date(s) … but the selected report date is …" | Today/Yesterday report IDs swapped, or `AMAZON_ACCOUNT_TIMEZONE` is wrong |
-| exit 5, "no data rows" | Amazon returned an empty day; set `ALLOW_EMPTY_REPORT=true` only if that is legitimate |
-| exit 6, schema message | fix the table manually (the app never alters it) or the mapping; `sql/inspect_schema.sql` |
-| exit 6, `COMMIT OUTCOME UNKNOWN` | nothing to do by hand; the next run checks and records what happened. Inspect with `sql/verify_date.sql` |
-| exit 7 | data is committed. Compare `sql/verify_date.sql` with the CSV in `data/failed/`. Look for other writers to the table |
-| exit 8 | move the file named in the log from `data/downloads/` to `data/processed/` |
-| exit 9 | a run is still going (`ps aux | grep run.py`) |
-| Chromium fails to start | `uv run playwright install chromium`, `sudo … playwright install-deps chromium`; in containers `BROWSER_NO_SANDBOX=true` |
+| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | MySQL connection. The password is never written to the log |
+| `REPORT_TABLE` | Table name, written plainly: `search term report` |
+| `REPORT_MODE` | `both` (yesterday + today every run) or `cutoff` (one report, by the 12:30 rule) |
+| `REPORT_TIMEZONE`, `TODAY_REPORT_CUTOFF` | The cutoff rule: `Asia/Kolkata`, `12:30` |
+| `AMAZON_ACCOUNT_TIMEZONE` | The Amazon account's timezone (US: `America/Los_Angeles`) |
+| `REPORT_ID_TODAY`, `REPORT_ID_YESTERDAY` | IDs of the two saved reports |
+| `REPORT_NAME_TODAY`, `REPORT_NAME_YESTERDAY` | Report names. A run stops if the page doesn't show this name |
+| `AMAZON_ENTITY_ID` | The `entityId` from the report URL |
+| `REPORT_READY_TIMEOUT_SECONDS` | How long to wait for Amazon to finish a report (default 20 min) |
+| `ALLOW_EMPTY_REPORT` | `false` = an empty report is rejected instead of wiping the day |
+| `DUPLICATE_POLICY` | `warn` = keep repeated rows (normal); `fail` = reject the file |
+| `HEADLESS` | `true` = browser runs invisibly (normal for scheduled runs) |
+| `LOG_LEVEL` | `INFO` normally; `DEBUG` for more detail |
 
-To validate a file by hand: `uv run python run.py --validate-csv data/failed/<file>.csv --expected-date YYYY-MM-DD`.
+Settings already set as environment variables take priority over `.env`.
 
-## Security and credentials
+**Moving to the production database:** change the `DB_*` settings, then run
+`python run.py --check-db` before the next import.
 
-* `.env` (chmod 600) holds the DB password. The app warns if `.env` is readable by
-  other users. Logs pass through a redaction filter that removes the DB password,
-  URL credentials and every URL query string (Amazon SSO tokens, signed download
-  links). SQL errors are logged without parameter values (`hide_parameters`).
-* `data/session/` is the Amazon login (cookies). It is chmod 700, git-ignored, and
-  never read or logged by the app. Anyone with a copy can act as the account.
-* No passwords are typed by the automation, and CAPTCHA, OTP and MFA are never bypassed.
-* Screenshots can show account data. They are git-ignored; prune them periodically.
-* `.gitignore` excludes `.venv`, `.env`, `data/*` (except `.gitkeep`) and `logs/*`.
-* The MySQL account needs only `SELECT, INSERT, DELETE` on the one table.
+---
 
-## Verified vs. unverified
+## 10. Security
 
-**Tested here (automated, passing):** everything in [Tests](#tests). That includes
-the date rule, CSV validation, the transactional replace and rollback on a SQL
-database with the production identifiers, verification, recovery, file handling,
-locking and the CLI. It also includes the real Playwright/Chromium workflow
-against a **local mock** of the history page.
+* **`.env`** holds the database password. Don't share or commit it.
+* **`data/session/`** is a logged-in Amazon session. Anyone with a copy can use the account.
+* **Logs** automatically hide the database password, and also hide sign-in tokens and download
+  links that appear in web addresses.
+* **Screenshots** can show account data. Delete old ones from time to time.
+* **The tool never types passwords** and never gets around CAPTCHA, OTP or two-step verification.
+* **The MySQL user needs only** `SELECT, INSERT, DELETE` on the one table.
+* **`.gitignore`** excludes `.env`, `.venv`, `data/*` and `logs/*`.
 
-**Not yet verified — needs your environment:**
+---
 
-1. **Amazon Ads UI for the Search Term report.** The selectors come from the live
-   Campaign-report history page (verified 2026‑10‑20 in the sibling project).
-   Confirm them with `--inspect-report` and one `--dry-run`. Wording for failed
-   runs (`pattern_status_failed`) has never been observed live.
-2. **That saved Search Term reports offer "Today"/"Yesterday" periods** and contain
-   the 11 columns with these exact headers (and whether VCPM is available).
-   `--dry-run` shows the headers and any ignored columns.
-3. **The production table schema.** Run `--check-db` (read-only). Check that
-   column names match the mapping exactly (e.g. `Campaign Name` vs `Campaign name`),
-   that the types are compatible, that the engine is InnoDB, and how `Date` is
-   stored. SQLite stood in for MySQL in the tests, so MySQL-specific behaviour
-   (INFORMATION_SCHEMA engine query, mysql-connector binding of the spaced
-   identifiers, TIMESTAMP session zone) has not been exercised.
-4. **`AMAZON_ACCOUNT_TIMEZONE`.** Row times showing `PDT` on the live page suggest a
-   US (Pacific) account. Confirm in Amazon Ads account settings.
-5. **Headless session reuse** on the Ubuntu server (MFA prompts) depends on Amazon's
-   risk checks. Keep `BROWSER_USER_AGENT` the same as the browser used for `--login`.
-#   A m a z o n _ s e a r c h _ t e r m _ c r o n  
- 
+## 11. Technical reference
+
+### Project layout
+
+```
+app/
+  auth.py           session checks, interactive --login (never answers CAPTCHA/MFA)
+  browser.py        Playwright workflow, run identification, stale-download protection
+  config.py         .env loading/validation, paths, timezones, DB settings, REPORT_MODE
+  dates.py          12:30 IST rule + choosing the Today/Yesterday saved report
+  pipeline.py       orchestration (one report per call), recovery, choices_for_now()
+  processor.py      CSV decoding, header mapping, validation, typed records
+  database.py       schema inspection, compatibility, transactional date-scoped replace
+  verifier.py       post-commit verification
+  storage.py        run lock, import journal, safe file moves
+  logging_setup.py  compact console + rotating file log, secret redaction
+  exceptions.py     error classes → exit codes
+config/selectors.json   every UI selector (ordered candidates) + row-text patterns
+deploy/                 crontab.example, logrotate.example
+sql/                    inspect_schema.sql, verify_date.sql (read-only)
+tests/                  pytest suite
+run.py                  command line entry point
+```
+
+### Amazon browser workflow (`browser.py`)
+
+1. Start Chromium with the saved profile `data/session/`. The browser timezone is fixed to
+   `AMAZON_ACCOUNT_TIMEZONE`.
+2. Open `reporting/history?entityId=…&reportId=…`. Stop on sign-in, CAPTCHA or MFA (exit 3) or on
+   "Sorry, something went wrong".
+3. Record every visible run row and its *Date created*, note the trigger time, then click
+   **Actions ▸ Run**.
+4. Reload every `REPORT_POLL_INTERVAL_SECONDS` and look for **this** run: a row that was not there
+   before and was created no earlier than the trigger minute (minus `RUN_CLOCK_SKEW_SECONDS`).
+5. When that row shows **Download**, download it as
+   `data/downloads/<UTC stamp>_<date>_<period>_<report id>_search_term.csv`.
+
+**Stale-download protection.** In these cases the run fails rather than guess:
+* no new row has appeared yet. An older row's Download link is never used;
+* a new row's date can't be read;
+* two new runs appeared;
+* the new run has the same minute as an older run.
+
+Browser errors (exit 4) are retried once (`BROWSER_RETRIES`). Sign-in problems and
+"cannot tell which run" are not retried. Each failure saves a screenshot.
+
+### Selectors (`config/selectors.json`)
+
+Each key has an ordered list of candidates, and the first visible match wins. If Amazon changes its
+page, put a working selector at the top of the affected key. No code change is needed.
+`python run.py --inspect-report --headed` shows, for each key, how many elements every candidate
+matches. It also shows the parsed history rows and whether the **Run** menu item was found. It opens
+the Actions menu but never clicks Run.
+
+### CSV validation (`processor.py`): all before MySQL is touched
+
+* **File:** not empty; not ZIP/XLSX/PDF/HTML; UTF-8, UTF-16 or Windows-1252; every row has the same
+  number of fields.
+* **Headers:** case, extra spaces and BOM are ignored. All 11 required columns must exist.
+* **Dates:** one format must fit every row (`Oct 21, 2026`, `2026-10-21`, `10/21/2026`…), and every
+  row must have the expected date.
+* **Numbers:** read exactly (no floating point). `1,234` and `$12.50` are accepted. `abc`, `12%` and
+  `1e3` are rejected. Impressions, Clicks and Purchases must be whole and non-negative.
+* **Text:** kept exactly as Amazon wrote it. Date and Campaign name must not be empty.
+* **Empty report:** rejected unless `ALLOW_EMPTY_REPORT=true`.
+
+### Database import (`database.py`)
+
+1. **Inspect** the table. Refuse (exit 6, nothing changed) if:
+   * a mapped column is missing or has an incompatible type;
+   * an unmapped `NOT NULL` column has no default;
+   * the engine isn't InnoDB.
+2. **Check every value fits** before writing: text lengths, decimal places, integer ranges and
+   NOT NULL.
+3. **One transaction:** `DELETE` the date's rows, `INSERT` in batches of 1,000, then count. It
+   **COMMITs** only if the count equals the CSV's row count; otherwise it **ROLLs BACK**.
+4. **Retries** happen only after a connection error that was rolled back. If COMMIT itself fails,
+   the outcome is recorded as unknown and resolved by the next run.
+
+The date filter adapts to the `Date` column type: `DATE`, `DATETIME`/`TIMESTAMP` (whole-day
+range) or text (`DB_TEXT_DATE_FORMAT`).
+
+### Verification (`verifier.py`)
+
+After COMMIT, on a fresh connection, it checks that:
+* the required columns still exist;
+* the row count equals the CSV's;
+* the NULL counts and totals of Impressions, Clicks, Units, Spend and Sales equal the CSV's;
+* the count and totals of **all other dates** are unchanged.
+
+A failure exits with code 7. The data is already committed.
+
+### Recovery (`storage.py`, `pipeline.py`)
+
+`data/state/import_journal.json` tracks each import through `started → committed → verified →
+archived`. If a run was interrupted, the next run first compares the table with the recorded
+expectations. It records the outcome before starting anything new. Filenames are unique, a move
+never overwrites, and files are never bulk-deleted.
+
+---
+
+## 12. Tests
+
+```bash
+uv run pytest -q -m "not integration"   # fast suite (~5 s)
+uv run pytest -v                        # also the real-Chromium tests (~45 s)
+```
+
+The tests use a temporary SQLite database with the same table and column names, plus a local fake
+of the Amazon history page. They never contact Amazon or MySQL.
+
+| File | Covers |
+|---|---|
+| `test_dates.py` | 12:30 cutoff edges, timezones, Today/Yesterday choice, not-yet-started skip |
+| `test_processor.py` | headers, encodings, numbers, NULLs, dates, blank search terms, duplicates |
+| `test_database.py` | schema checks, rollback restores deleted rows, other dates preserved, reruns |
+| `test_verifier.py` | count/total mismatches, other dates changed |
+| `test_pipeline.py` | full run, failures at each stage, dry run, recovery, `REPORT_MODE=both` |
+| `test_browser_logic.py` | run identification, stale Download never used, polling, retries |
+| `test_browser_integration.py` | real Chromium against a local mock of the report page |
+| `test_storage_and_cli.py` | run lock, safe moves, journal, log redaction, exit codes |
+
+On Windows, one timezone test is skipped because it is POSIX-only.
+
+---
+
+## 13. What has been verified
+
+**Live, on 2026-10-22** (Windows PC, local test database `search_term`):
+* MySQL connection and schema check (`--check-db`).
+* Amazon login, and the selectors on the real Search Term report pages (`--inspect-report`).
+* Full runs of **both** saved reports, all verified:
+  * Today report: 15,181 rows, then refreshed to 25,186.
+  * Yesterday report: 184,233 rows.
+* The account's CSV is **hourly**, includes Sponsored Display rows with blank search terms, and has
+  no VCPM column. VCPM is written as NULL.
+
+**Not yet verified:**
+* The **production** database (`powerbidb`). Run `--check-db` against it before switching.
+* Amazon's wording for a *failed* report run (`pattern_status_failed`) has never been seen live.
+* Long-term reuse of the login by scheduled headless runs. If Amazon asks for OTP often, set
+  `BROWSER_USER_AGENT` to the same browser used for `--login`.

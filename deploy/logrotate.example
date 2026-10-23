@@ -1,0 +1,20 @@
+# /etc/logrotate.d/amazon_search_term_report
+#
+# logs/app.log is already rotated by the application (RotatingFileHandler,
+# LOG_MAX_BYTES x LOG_BACKUP_COUNT). This file rotates cron.log, which cron
+# appends to. copytruncate: cron reopens the file on every run anyway.
+#
+# Install:  sudo cp deploy/logrotate.example /etc/logrotate.d/amazon_search_term_report
+# Test:     sudo logrotate --debug /etc/logrotate.d/amazon_search_term_report
+
+/opt/Amazon_search_term_report_cron/logs/cron.log {
+    su amzreports amzreports
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    create 0640 amzreports amzreports
+}

@@ -1,0 +1,31 @@
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data: browser session (a credential), reports, screenshots, state
+data/session/*
+data/downloads/*
+data/processed/*
+data/failed/*
+data/screenshots/*
+data/state/*
+!data/*/.gitkeep
+
+# Logs
+logs/*
+!logs/.gitkeep
+*.log
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

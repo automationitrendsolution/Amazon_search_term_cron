@@ -1,0 +1,22 @@
+# Amazon Ads Search Term report -> MySQL, every hour at minute 5.
+#
+# Install for the runtime user (NOT root), e.g. the 'amzreports' user:
+#   sudo -u amzreports crontab -e      # then paste the lines below
+#
+# Adjust:
+#   /opt/Amazon_search_term_report_cron   -> the project directory
+#   /home/amzreports/.local/bin/uv         -> output of: sudo -u amzreports which uv
+#
+# * flock -n: if the previous run is still going, this one exits immediately
+#   (the app also holds its own lock in data/state/run.lock).
+# * timeout: hard stop after 55 minutes so a hung browser can never block the
+#   next hour (REPORT_READY_TIMEOUT_SECONDS defaults to 20 minutes).
+# * TZ is irrelevant to report-date selection (the app always uses Asia/Kolkata);
+#   it is set only so cron.log timestamps are readable.
+# * Exit codes are listed in README.md ("Exit codes"); they are recorded in cron.log.
+
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+TZ=Asia/Kolkata
+
+5 * * * * cd /opt/Amazon_search_term_report_cron && /usr/bin/flock -n /tmp/amazon_search_term_report.lock /usr/bin/timeout 55m /home/amzreports/.local/bin/uv run --locked --no-sync python run.py >> logs/cron.log 2>&1; echo "$(date -Is) exit=$?" >> logs/cron.log

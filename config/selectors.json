@@ -1,0 +1,98 @@
+{
+  "_comment": "Ordered candidate lists: the first candidate that is visible wins. Any Playwright selector engine works (css, text=, role=, xpath=, '>>' chaining). Keys starting with '_' are comments. 'pattern_*' keys are Python regular expressions applied to the text of a report-history row. To fix a broken run, put the working selector at the TOP of the named key; no code change is needed. Check every key with: uv run python run.py --inspect-report",
+
+  "_verification_status": "VERIFIED-ELSEWHERE = verified on 2026-10-20/21 against the live Amazon Ads reporting/history page and Amazon sign-in pages by the sibling Amazon_ad_campaign_report_cron project (a Campaign report, same reporting console). They have NOT yet been confirmed against this account's Search Term report page. UNVERIFIED = best guess, confirm with --inspect-report.",
+
+  "_note_sign_in": "VERIFIED-ELSEWHERE (Amazon sign-in / two-step verification pages).",
+  "sign_in_marker": [
+    "form[name='signIn']",
+    "#ap_email",
+    "#ap_password",
+    "input[name='email'][type='email']",
+    "text=/Sign in to continue/i"
+  ],
+  "security_challenge_marker": [
+    "form[action*='validateCaptcha']",
+    "#auth-mfa-otpcode",
+    "input[name='otpCode']",
+    "img[alt*='captcha' i]",
+    "text=/Enter the characters you see/i",
+    "text=/Two-Step Verification/i"
+  ],
+
+  "_note_reporting": "UNVERIFIED. Shown on https://advertising.amazon.com/reporting once signed in; used only to confirm --login finished. The URL check (no /ap/ sign-in path) is the primary signal.",
+  "reporting_loaded_marker": [
+    "role=grid",
+    "role=table",
+    "role=button[name=/create report/i]",
+    "text=/Sponsored ads reports/i",
+    "role=navigation"
+  ],
+
+  "_note_history": "VERIFIED-ELSEWHERE: reporting/history?entityId=...&reportId=... shows 'Close report', an 'Actions' dropdown (Run, Copy, Delete) and an AG Grid with columns Report status | Date created | Report period | Sent to | Actions, newest first. A pending run shows 'Processing' and '-' in Actions; a finished run shows 'Completed' and a 'Download' link. Without entityId the page shows 'Sorry, something went wrong'.",
+  "report_error_marker": [
+    "text=/Sorry, something went wrong/i"
+  ],
+  "report_history_loaded_marker": [
+    "role=grid",
+    "role=table",
+    "table"
+  ],
+  "report_not_found_marker": [
+    "text=/report (was )?not found/i",
+    "text=/does(n't| not) exist/i",
+    "text=/no longer available/i",
+    "text=/you don't have (access|permission)/i"
+  ],
+  "report_actions_menu": [
+    "role=button[name=/^Actions$/i]",
+    "button:has-text('Actions')"
+  ],
+  "_note_run": "VERIFIED-ELSEWHERE: the run entry is the menu item 'Run' inside the Actions dropdown, anchored to the exact word so it can never match Copy or Delete. run_report_button is an UNVERIFIED fallback in case Amazon adds a standalone button.",
+  "run_report_menu_item": [
+    "role=menuitem[name=/^Run$/i]",
+    "[role='menu'] >> role=menuitem[name=/^Run$/i]"
+  ],
+  "run_report_button": [
+    "role=button[name=/^run report$/i]",
+    "button:has-text('Run report')"
+  ],
+  "_note_confirm": "UNVERIFIED: no confirmation dialog was seen on the live page; kept in case one appears.",
+  "run_report_confirm_button": [
+    "[role='dialog'] >> role=button[name=/^run( report)?$/i]"
+  ],
+  "_note_rows": "VERIFIED-ELSEWHERE: data rows of the run-history grid. Header rows must not match.",
+  "history_row": [
+    ".ag-center-cols-container .ag-row:not(.ag-row-loading)",
+    "table tbody tr",
+    "[role='row']:has([role='gridcell'])"
+  ],
+  "_note_download": "VERIFIED-ELSEWHERE: a 'Download' link inside a finished row. Always evaluated INSIDE the row matched to this execution's run, never page-wide.",
+  "history_row_download": [
+    "a:has-text('Download')",
+    "button:has-text('Download')",
+    "[aria-label*='download' i]"
+  ],
+  "loading_indicator": [
+    "[data-testid='storm-ui-icon-spinner']",
+    "[data-testid='skeleton']",
+    "[role='progressbar']",
+    "[aria-busy='true']"
+  ],
+
+  "_note_patterns": "Applied to a history row's text, e.g. the live text 'Completed Oct 20, 2026 2:00 AM PDT Today - Download' (VERIFIED-ELSEWHERE format). pattern_created_at must expose a named group 'ts' and optionally 'tz' (a timezone abbreviation). Status words for failed/pending runs other than 'Processing' are UNVERIFIED.",
+  "pattern_created_at": [
+    "(?P<ts>(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\\.? \\d{1,2}, \\d{4},? \\d{1,2}:\\d{2}(?::\\d{2})?\\s?[AaPp]\\.?[Mm]\\.?)(?:\\s+(?P<tz>[A-Z]{2,5})\\b)?"
+  ],
+  "pattern_status_ready": [
+    "\\bCompleted?\\b",
+    "\\bReady\\b",
+    "\\bSuccess(ful)?\\b"
+  ],
+  "pattern_status_failed": [
+    "\\bFail(ed|ure)?\\b",
+    "\\bError\\b",
+    "\\bCancel+ed\\b",
+    "\\bExpired\\b"
+  ]
+}
