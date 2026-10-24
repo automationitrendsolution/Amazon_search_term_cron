@@ -113,35 +113,39 @@ database keeps its previous data.
 
 This is set by `REPORT_MODE` in `.env`.
 
+### Two calendars (important)
+
+| | Calendar | Setting |
+|---|---|---|
+| What Amazon means by **"Today" / "Yesterday"** in a saved report | **India (IST)**, your Amazon user's timezone | `REPORT_PERIOD_TIMEZONE` (defaults to `REPORT_TIMEZONE`) |
+| The **date on each CSV row** (and in MySQL) | **US Pacific**, the marketplace | `AMAZON_ACCOUNT_TIMEZONE=America/Los_Angeles` |
+
+So the *Today* report contains the Pacific-time day **with the same date as today in India**. That
+day only starts at **12:30 PM India time** (midnight Pacific; 1:30 PM in winter). Before then, the
+*Today* report has no data yet. This was observed live on 2026-10-23: at 00:31 IST, Amazon's
+"Yesterday" report already returned the previous India date.
+
 ### `REPORT_MODE=both` (recommended, currently in use)
 
-Every run imports **both** reports, one after the other:
+Every run imports **yesterday** and **today**, using India's dates:
 
-1. **Yesterday** report → replaces yesterday's rows
-2. **Today** report → replaces today's rows
+| Time in India | Reports run |
+|---|---|
+| 12:00 AM – 12:29 PM | **Yesterday** only. Today's Pacific day hasn't started, so it is skipped without contacting Amazon |
+| 12:30 PM – 11:59 PM | **Yesterday**, then **Today** |
 
-Amazon keeps updating sales and attribution for a few hours after a day ends. Refreshing
-yesterday on every run picks up those late changes. If one report fails, the other still runs.
+Yesterday keeps being refreshed until midnight India time. That picks up the end of the Pacific day
+and Amazon's late sales and attribution updates. If one report fails, the other still runs.
 
 ### `REPORT_MODE=cutoff` (one report per run)
 
-The date depends on the time in India:
+| Time in India | Report | Date imported |
+|---|---|---|
+| 12:00 AM – 12:29 PM | Yesterday | yesterday (India date) |
+| 12:30 PM – 11:59 PM | Today | today (India date) |
 
-| Time in India | Date imported |
-|---|---|
-| 12:00 AM – 12:29 PM | yesterday |
-| 12:30 PM – 11:59 PM | today |
-
-### Why the dates follow US Pacific time
-
-Amazon decides what "Today" and "Yesterday" mean in the **advertiser account's** timezone. For this
-account that's US Pacific (`AMAZON_ACCOUNT_TIMEZONE=America/Los_Angeles`). The dates in MySQL
-match the dates inside Amazon's CSV.
-
-* 12:30 PM in India = 12:00 AM Pacific (summer time). That's where the 12:30 cutoff comes from.
-* In winter (Pacific standard time), 12:00 AM Pacific = 1:30 PM in India. In `cutoff` mode, runs
-  between 12:30 and 1:30 PM India time are **skipped safely**, because the new day has not started
-  for Amazon yet. The next hourly run picks it up.
+In winter, runs between 12:30 and 1:30 PM India time are **skipped safely**, because the Pacific day
+hasn't started yet. The next hourly run picks it up.
 
 Before importing, the app always checks that every row in the CSV has the expected date. A wrong
 report can never be imported under the wrong date.
@@ -399,7 +403,8 @@ Then resume the schedule. Keep `.env` and `data/` when you replace files.
 | `REPORT_TABLE` | Table name, written plainly: `search term report` |
 | `REPORT_MODE` | `both` (yesterday + today every run) or `cutoff` (one report, by the 12:30 rule) |
 | `REPORT_TIMEZONE`, `TODAY_REPORT_CUTOFF` | The cutoff rule: `Asia/Kolkata`, `12:30` |
-| `AMAZON_ACCOUNT_TIMEZONE` | The Amazon account's timezone (US: `America/Los_Angeles`) |
+| `AMAZON_ACCOUNT_TIMEZONE` | The marketplace calendar of the CSV dates (US: `America/Los_Angeles`) |
+| `REPORT_PERIOD_TIMEZONE` | The calendar Amazon uses for "Today"/"Yesterday" (your user's timezone; default = `REPORT_TIMEZONE`) |
 | `REPORT_ID_TODAY`, `REPORT_ID_YESTERDAY` | IDs of the two saved reports |
 | `REPORT_NAME_TODAY`, `REPORT_NAME_YESTERDAY` | Report names. A run stops if the page doesn't show this name |
 | `AMAZON_ENTITY_ID` | The `entityId` from the report URL |

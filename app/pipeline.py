@@ -25,7 +25,14 @@ from .database import (
     replace_report_date,
 )
 from .dates import ReportChoice, choose_report, select_report_date, utc_now
-from .exceptions import ArchiveError, DatabaseError, EmptyReportError, ValidationError, VerificationError
+from .exceptions import (
+    ArchiveError,
+    DatabaseError,
+    EmptyReportError,
+    ReportNotAvailableError,
+    ValidationError,
+    VerificationError,
+)
 from .logging_setup import get_logger, set_context, stage
 from .processor import ProcessedReport, process_csv
 from .storage import ImportJournal, archive_processed, quarantine_failed, sha256_of
@@ -55,6 +62,7 @@ def choose_for_now(settings: Settings, now: datetime | None = None) -> ReportCho
     choice = choose_report(
         report_date,
         account_tz=settings.amazon_account_timezone,
+        period_tz=settings.period_tz,
         report_id_today=settings.report_id_today,
         report_id_yesterday=settings.report_id_yesterday,
         name_today=settings.report_name_today,
@@ -76,24 +84,31 @@ def choose_for_now(settings: Settings, now: datetime | None = None) -> ReportCho
 def choices_for_now(settings: Settings, now: datetime | None = None) -> list[ReportChoice]:
     """The reports this run imports: one (REPORT_MODE=cutoff) or Yesterday then Today (both).
 
-    In "both" mode the dates come from the Amazon account's calendar, so each
-    saved report is matched with the date Amazon puts in its CSV.
+    In "both" mode the two dates are yesterday and today in the calendar Amazon
+    uses for the saved reports' "Yesterday"/"Today" (``period_tz``, IST).  A date
+    that has not started yet in the account's marketplace calendar (US Pacific,
+    e.g. "today" before 12:30 IST) has no data, so that report is skipped.
     """
     if settings.report_mode != "both":
         return [choose_for_now(settings, now)]
     moment = now or utc_now()
-    account_today = moment.astimezone(settings.amazon_account_timezone).date()
+    period_today = moment.astimezone(settings.period_tz).date()
     choices = []
-    for report_date in (account_today - timedelta(days=1), account_today):
-        choice = choose_report(
-            report_date,
-            account_tz=settings.amazon_account_timezone,
-            report_id_today=settings.report_id_today,
-            report_id_yesterday=settings.report_id_yesterday,
-            name_today=settings.report_name_today,
-            name_yesterday=settings.report_name_yesterday,
-            now=moment,
-        )
+    for report_date in (period_today - timedelta(days=1), period_today):
+        try:
+            choice = choose_report(
+                report_date,
+                account_tz=settings.amazon_account_timezone,
+                period_tz=settings.period_tz,
+                report_id_today=settings.report_id_today,
+                report_id_yesterday=settings.report_id_yesterday,
+                name_today=settings.report_name_today,
+                name_yesterday=settings.report_name_yesterday,
+                now=moment,
+            )
+        except ReportNotAvailableError as exc:
+            logger.info("Not running the report for %s: %s", report_date, exc)
+            continue
         logger.info("Selected report date %s -> '%s' report %s", report_date, choice.period, choice.report_id)
         choices.append(choice)
     return choices

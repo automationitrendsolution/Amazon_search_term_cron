@@ -206,6 +206,14 @@ class Settings:
     amazon_email: str | None = None
     amazon_password: str | None = None
 
+    #: The calendar Amazon uses for a saved report's "Today"/"Yesterday" (the
+    #: user's timezone).  None = same as amazon_account_timezone.
+    report_period_timezone: ZoneInfo | None = None
+
+    @property
+    def period_tz(self) -> ZoneInfo:
+        return self.report_period_timezone or self.amazon_account_timezone
+
     @property
     def required_dirs(self) -> tuple[Path, ...]:
         return (
@@ -272,6 +280,9 @@ def load_settings() -> Settings:
 
     return Settings(
         report_mode=report_mode,
+        # Observed live: Amazon resolves Today/Yesterday in the user's timezone (IST),
+        # so it defaults to REPORT_TIMEZONE rather than the account's US timezone.
+        report_period_timezone=_zone("REPORT_PERIOD_TIMEZONE", _env("REPORT_TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata"),
         amazon_email=_env("AMAZON_EMAIL"),
         amazon_password=_env("AMAZON_PASSWORD"),
         report_timezone=_zone("REPORT_TIMEZONE", "Asia/Kolkata"),

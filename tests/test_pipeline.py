@@ -248,3 +248,43 @@ def test_import_retry_policy(settings, monkeypatch, committed, transient, expect
         with pytest.raises(DatabaseError):
             pipeline._replace_with_retry(settings, None, None, None, "%Y-%m-%d", [], sleep=lambda s: None)
     assert len(calls) == expected_calls
+
+
+# Live observation, 2026-10-23 (US account, user in India): Amazon resolves the saved
+# reports' Today/Yesterday in IST, while the CSV rows carry US Pacific dates.
+LA_TZ = "America/Los_Angeles"
+
+
+def _us_account(settings, mode="both"):
+    from dataclasses import replace
+    from zoneinfo import ZoneInfo
+
+    return replace(settings, report_mode=mode, amazon_account_timezone=ZoneInfo(LA_TZ),
+                   report_period_timezone=ZoneInfo("Asia/Kolkata"))
+
+
+@pytest.mark.parametrize(
+    ("utc", "expected"),
+    [
+        # 23:30 IST: both days available (this run imported correctly on the server)
+        (datetime(2026, 10, 23, 18, 0, tzinfo=UTC), [("yesterday", "2026-10-22"), ("today", "2026-10-23")]),
+        # 00:31 IST Oct 24: Amazon's "Yesterday" is Oct 23; Oct 24 has not started in Pacific
+        (datetime(2026, 10, 23, 19, 1, tzinfo=UTC), [("yesterday", "2026-10-23")]),
+        # 11:30 IST: IST-today has not started in Pacific yet
+        (datetime(2026, 10, 24, 6, 0, tzinfo=UTC), [("yesterday", "2026-10-23")]),
+        # 12:37 IST: Pacific midnight has passed, so IST-today has data
+        (datetime(2026, 10, 24, 7, 7, tzinfo=UTC), [("yesterday", "2026-10-23"), ("today", "2026-10-24")]),
+    ],
+)
+def test_both_mode_follows_amazons_ist_calendar(settings, utc, expected) -> None:
+    choices = pipeline.choices_for_now(_us_account(settings), utc)
+    assert [(c.period, c.report_date.isoformat()) for c in choices] == expected
+
+
+def test_cutoff_mode_before_1230_ist_uses_yesterday_report(settings) -> None:
+    morning = datetime(2026, 10, 24, 4, 30, tzinfo=UTC)  # 10:00 IST
+    choice = pipeline.choose_for_now(_us_account(settings, "cutoff"), morning)
+    assert (choice.period, choice.report_date.isoformat()) == ("yesterday", "2026-10-23")
+    afternoon = datetime(2026, 10, 24, 7, 30, tzinfo=UTC)  # 13:00 IST
+    choice = pipeline.choose_for_now(_us_account(settings, "cutoff"), afternoon)
+    assert (choice.period, choice.report_date.isoformat()) == ("today", "2026-10-24")
