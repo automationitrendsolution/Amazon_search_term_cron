@@ -67,6 +67,19 @@ Otherwise use `uv run python run.py …`. Both do the same thing.
 > In PowerShell, always type `python` before `run.py`. Typing `run.py` on its own gives
 > *"The term 'run.py' is not recognized"*.
 
+**On the Ubuntu server**, there is no `python` command (only `python3`), and the system
+`python3` does not have the project's packages. Use one of these instead, from
+`/data/cron/Amazon_search_term_cron`:
+
+```bash
+uv run python run.py --dry-run          # through uv, like the cron job
+.venv/bin/python run.py --dry-run       # the project's Python directly
+source .venv/bin/activate               # or activate once per shell,
+python run.py --dry-run                 # then the commands in the table work as written
+```
+
+*`Command 'python' not found`* means you typed `python` without one of these.
+
 ### What a normal run looks like
 
 ```
@@ -216,6 +229,9 @@ Every run ends with an **exit code**, and the summary shows it. In most cases th
 | `Access denied for user ...` | Wrong DB user/password in `.env`, or the user lacks permission (§7 step 3) |
 | `Destination table ... does not exist` | Create the table (§7 step 3) |
 | `sign-in-required` / `security-challenge` | `python run.py --login` |
+| `two-step page this tool does not recognise` (during `--login`) | Amazon changed its code page. Add the code box from the listed fields to `otp_input` in `config/selectors.json` |
+| `Command 'python' not found` (Ubuntu) | Use `uv run python run.py` or `.venv/bin/python run.py` (§2) |
+| `.env is readable by other users` | `chmod 600 .env` |
 | `Sorry, something went wrong` | `AMAZON_ENTITY_ID` is wrong, or this login cannot see the report |
 | `still 'pending' after ...s` | Amazon is slow. Raise `REPORT_READY_TIMEOUT_SECONDS` (keep it under 50 min) |
 | `selector key '...'` | Amazon changed its page. Run `python run.py --inspect-report --headed` (§11) |
@@ -325,6 +341,12 @@ A text message with a code has been sent to your phone ending in 42
   Code accepted.
 ```
 
+If Amazon first asks **where to send the code** (the *Send OTP* page at `/ap/mfa/new-otp`), the
+tool keeps Amazon's default choice and clicks *Send*, then asks you for the code as above. If
+Amazon shows a two-step page the tool doesn't recognise, it stops straight away. The error lists the
+page's form fields and saves a screenshot, so the right selector can be added to
+`config/selectors.json` (`otp_input` or `otp_send_code_button`).
+
 The tool ticks "Don't require code on this browser" for you. You get 3 tries, then it stops so the
 account is not locked. An image CAPTCHA can't be answered from a terminal. If one appears, sign in
 once with a visible browser (`ssh -X` / MobaXterm).
@@ -424,7 +446,8 @@ Settings already set as environment variables take priority over `.env`.
 
 ## 10. Security
 
-* **`.env`** holds the database password. Don't share or commit it.
+* **`.env`** holds the database and Amazon passwords. Don't share or commit it. On Linux, make it
+  readable by its owner only: `chmod 600 .env`. Each run warns until you do.
 * **`data/session/`** is a logged-in Amazon session. Anyone with a copy can use the account.
 * **Logs** automatically hide the database password, and also hide sign-in tokens and download
   links that appear in web addresses.

@@ -337,9 +337,62 @@ def _stop_on_captcha(session) -> None:
     )
 
 
+def _on_challenge_url(page: Page) -> bool:
+    path = page.url.lower().split("?", 1)[0]
+    return any(marker in path for marker in ("/ap/mfa", "/ap/cvf", "/ap/challenge"))
+
+
+def _form_fields(page: Page) -> str:
+    """ids/names/types of the inputs and buttons on the page (never their values)."""
+    try:
+        fields = page.eval_on_selector_all(
+            "input, button",
+            "els => els.filter(e => e.offsetParent !== null && e.type !== 'hidden')"
+            ".map(e => `${e.tagName.toLowerCase()}#${e.id || '-'}[name=${e.name || '-'}][type=${e.type || '-'}]`)",
+        )
+        return ", ".join(fields[:20]) or "(none)"
+    except Exception:
+        return "(could not read the form)"
+
+
+def _find_otp_field(session, *, wait_seconds: float = 20.0):
+    """The code box, after clicking 'Send OTP' on a choose-where-to-send page if shown.
+
+    Amazon may land on the two-step page several seconds after the password is
+    submitted, so this keeps looking for up to ``wait_seconds``.  Returns None
+    when the sign-in finished without a code.
+    """
+    deadline = time.monotonic() + wait_seconds
+    sent = False
+    while True:
+        field = session.find_first("otp_input", timeout_ms=2_000)
+        if field is not None:
+            return field
+        if _on_challenge_url(session.page) and not sent:
+            send = session.find_first("otp_send_code_button", timeout_ms=1_000)
+            if send is not None:
+                logger.info("Amazon asks where to send the two-step code; using its default choice")
+                send.click()
+                _settle(session.page)
+                sent = True
+                deadline = time.monotonic() + wait_seconds
+                continue
+        if time.monotonic() >= deadline:
+            break
+    if _on_challenge_url(session.page):
+        session.capture_failure("otp-page-not-recognised")
+        raise AuthenticationError(
+            "Amazon is showing a two-step page this tool does not recognise "
+            f"({urlsplit(session.page.url).path}). Its form fields: {_form_fields(session.page)}. "
+            "Add the code box to 'otp_input' (or the send button to 'otp_send_code_button') in "
+            "config/selectors.json and run --login again."
+        )
+    return None
+
+
 def _answer_otp_if_asked(session, *, prompt: Callable[[str], str], announce: Callable[[str], None]) -> None:
     """Fill Amazon's two-step code, read from the person at the terminal."""
-    field = session.find_first("otp_input", timeout_ms=4_000)
+    field = _find_otp_field(session)
     if field is None:
         logger.info("Amazon did not ask for a two-step code")
         return

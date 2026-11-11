@@ -27,9 +27,10 @@
   "signin_submit_button": ["#signInSubmit", "input#signInSubmit", "role=button[name=/^sign in$/i]"],
   "signin_remember_me": ["input[name='rememberMe']", "#rememberMe"],
   "signin_error_message": ["#auth-error-message-box", "div.a-alert-error .a-alert-content", "[role='alert'] .a-alert-content"],
-  "otp_input": ["#auth-mfa-otpcode", "input[name='otpCode']", "input[type='tel'][name*='otp' i]"],
+  "otp_input": ["#auth-mfa-otpcode", "input[name='otpCode']", "#input-box-otp", "#cvf-input-code", "input[name='otc']", "input[name='code']", "input[autocomplete='one-time-code']", "input[type='tel'][name*='otp' i]"],
+  "otp_send_code_button": ["#auth-send-code", "input#auth-send-code", "#cvf-submit-otp-button", "role=button[name=/send (otp|code)/i]", "#continue"],
   "otp_remember_device": ["#auth-mfa-remember-device", "input[name='rememberDevice']"],
-  "otp_submit_button": ["#auth-signin-button", "input[name='mfaSubmit']", "input#auth-signin-button"],
+  "otp_submit_button": ["#auth-signin-button", "input[name='mfaSubmit']", "input#auth-signin-button", "#cvf-submit-otp-button", "input[aria-labelledby='cvf-submit-otp-button-announce']", "role=button[name=/^(submit|verify|sign in|continue)/i]"],
   "captcha_marker": ["form[action*='validateCaptcha']", "#auth-captcha-image", "img[alt*='captcha' i]", "text=/Enter the characters you see/i"],
 
   "_note_reporting": "UNVERIFIED. Shown on https://advertising.amazon.com/reporting once signed in; used only to confirm --login finished. The URL check (no /ap/ sign-in path) is the primary signal.",

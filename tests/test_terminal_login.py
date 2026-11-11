@@ -181,3 +181,35 @@ def test_password_is_redacted_from_logs(monkeypatch) -> None:
 
 def test_email_is_masked() -> None:
     assert auth._mask_email("buyer@example.com") == "b***r@example.com"
+
+
+class SendCodeSession(FakeSession):
+    """Amazon's /ap/mfa/new-otp: choose where to send the code, then the code box."""
+
+    def _to(self, state: str) -> None:
+        if state == "otp":
+            self.page.url = "https://www.amazon.com/ap/mfa/new-otp?x=1"
+            state = "choose"
+        super()._to(state)
+
+    def find_first(self, key: str, *, timeout_ms: int = 0):
+        if key == "otp_send_code_button" and self.state == "choose":
+            return FakeField(self.log, "send-code", lambda: setattr(self, "state", "otp"))
+        return super().find_first(key, timeout_ms=timeout_ms)
+
+
+def test_send_code_page_is_answered_before_the_code(creds) -> None:
+    session = SendCodeSession(otp_codes_accepted={"123456"})
+    said = run_login(creds, session, ["123456"])
+    names = [k for k, _ in session.log]
+    assert names.index("send-code") < names.index("otp")
+    assert "  Code accepted." in said
+
+
+def test_unrecognised_two_step_page_stops_with_its_fields() -> None:
+    session = FakeSession(otp_codes_accepted=set())
+    session.state = "unknown"
+    session.page.url = "https://www.amazon.com/ap/mfa/new-otp?x=1"
+    with pytest.raises(AuthenticationError, match="does not recognise.*/ap/mfa/new-otp"):
+        auth._find_otp_field(session, wait_seconds=0)
+    assert ("failure", "otp-page-not-recognised") in session.log
